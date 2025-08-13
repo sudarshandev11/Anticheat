@@ -1,145 +1,63 @@
+<#
+.SYNOPSIS
+    Checks for suspicious DLLs loaded into a target process.
+
+.DESCRIPTION
+    This script scans the loaded modules (DLLs) of a target process (default: msiexec.exe),
+    compares them against a list of safe Windows directories, and flags any that are outside these paths.
+
+.PARAMETER ProcessName
+    Name of the target process (default: msiexec).
+
+.EXAMPLE
+    .\check_injected_dlls.ps1 -ProcessName msiexec
+
+    Scans msiexec for suspicious DLLs.
+#>
+
 param(
-    [Parameter(Mandatory=$true)]
-    [string[]] $ProcessNames,          # Target processes (e.g., "BlueStacks","HD-Player")
-    [int] $IntervalSeconds = 5,        # Check interval
-    [string] $LogPath = "$PSScriptRoot\process_module_monitor.log",
-    [string] $CsvPath = "$PSScriptRoot\incidents.csv",
-    [string] $ReportUrl = "https://yourserver.example.com/report-cheat",  # Change this
-    [switch] $PopupAlerts
+    [string]$ProcessName = "msiexec"
 )
 
-function Write-Log {
-    param($Text)
-    $t = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
-    $line = "$t`t$Text"
-    $line | Out-File -FilePath $LogPath -Append -Encoding utf8
-    Write-Host $line
+# Get the process object
+$proc = Get-Process -Name $ProcessName -ErrorAction SilentlyContinue
+
+if (-not $proc) {
+    Write-Host "❌ Process '$ProcessName' not found." -ForegroundColor Red
+    exit
 }
 
-function Log-Incident {
-    param($procName, $pid, $type, $detail)
-    $time = (Get-Date).ToString("o")
-    $obj = [PSCustomObject]@{
-        Time = $time
-        ProcessName = $procName
-        PID = $pid
-        Type = $type
-        Detail = $detail
-    }
-    if (-not (Test-Path $CsvPath)) {
-        $obj | Export-Csv -Path $CsvPath -NoTypeInformation
-    } else {
-        $obj | Export-Csv -Path $CsvPath -Append -NoTypeInformation
-    }
-}
+Write-Host "🔍 Checking loaded DLLs for process ID $($proc.Id) - $ProcessName" -ForegroundColor Cyan
 
-function Get-FileHashSafe {
-    param($path)
-    try {
-        if ([string]::IsNullOrWhiteSpace($path) -or -not (Test-Path $path)) { return $null }
-        return (Get-FileHash -Path $path -Algorithm SHA256 -ErrorAction Stop).Hash
-    } catch { return $null }
-}
+# Known safe DLL paths
+$safePaths = @(
+    "$env:windir\System32",
+    "$env:windir\SysWOW64",
+    "$env:windir\WinSxS"
+)
 
-# Suspicious handle check: See which processes opened target with write access
-function Get-SuspiciousHandles {
-    param($targetPid)
-    try {
-        $handleList = Get-Process | ForEach-Object {
-            $p = $_
-            try {
-                $handles = (Get-Process -Id $p.Id -ErrorAction SilentlyContinue) | Out-Null
-                $access = (Get-Process -Id $p.Id -IncludeUserName -ErrorAction SilentlyContinue)
-                # In a real EDR, you'd inspect handles here via SysInternals 'handle.exe'
-            } catch {}
-        }
-    } catch {}
-}
+# Collect results
+$result = @()
 
-$state = @{}
+foreach ($module in $proc.Modules) {
+    $path = $module.FileName
+    $isSafe = $false
 
-Write-Log "=== Module Monitor START ==="
-Write-Log "Watching: $($ProcessNames -join ', '), interval ${IntervalSeconds}s"
-
-while ($true) {
-    foreach ($pName in $ProcessNames) {
-        try { $procs = Get-Process -Name $pName -ErrorAction SilentlyContinue } catch { $procs = @() }
-        if (-not $procs) { continue }
-
-        foreach ($proc in $procs) {
-            $pid = $proc.Id
-            $modules = @()
-            try {
-                $modules = $proc.Modules | ForEach-Object {
-                    [PSCustomObject]@{
-                        ModuleName = $_.ModuleName
-                        FileName   = $_.FileName
-                    }
-                }
-            } catch {
-                Write-Log "WARN: Could not read modules for $($proc.ProcessName) (PID $pid)"
-                continue
-            }
-
-            $current = @{}
-            foreach ($m in $modules) {
-                if ([string]::IsNullOrEmpty($m.FileName)) { continue }
-                $hash = Get-FileHashSafe -path $m.FileName
-                $current[$m.FileName.ToLower()] = @{
-                    ModuleName = $m.ModuleName
-                    Hash = $hash
-                }
-            }
-
-            if (-not $state.ContainsKey($pid)) {
-                $state[$pid] = $current
-                continue
-            }
-
-            $prev = $state[$pid]
-            $new = $current.Keys | Where-Object { -not $prev.ContainsKey($_) }
-            $removed = $prev.Keys | Where-Object { -not $current.ContainsKey($_) }
-            $changed = $current.Keys | Where-Object { $prev.ContainsKey($_) -and $prev[$_].Hash -ne $current[$_].Hash }
-
-            if ($new.Count -or $removed.Count -or $changed.Count) {
-                $msg = "ALERT: $($proc.ProcessName) PID $pid - New: $($new.Count), Removed: $($removed.Count), Changed: $($changed.Count)"
-                Write-Log $msg
-                Log-Incident $proc.ProcessName $pid "ModuleChange" $msg
-
-                # Report to server
-                try {
-                    $report = @{
-                        time = (Get-Date).ToString("o")
-                        process = $proc.ProcessName
-                        pid = $pid
-                        changes = @{
-                            new = $new
-                            removed = $removed
-                            changed = $changed
-                        }
-                    }
-                    Invoke-RestMethod -Uri $ReportUrl -Method Post -Body ($report | ConvertTo-Json -Depth 4) -ContentType "application/json" -TimeoutSec 5
-                } catch {
-                    Write-Log "WARN: Report failed: $($_.Exception.Message)"
-                }
-
-                # Kill the process
-                try {
-                    Stop-Process -Id $pid -Force
-                    Write-Log "ACTION: Process $pid killed due to module change."
-                    Log-Incident $proc.ProcessName $pid "Action" "Killed process"
-                } catch {
-                    Write-Log "WARN: Kill failed: $($_.Exception.Message)"
-                }
-
-                if ($PopupAlerts) {
-                    Add-Type -AssemblyName PresentationFramework
-                    [System.Windows.MessageBox]::Show($msg, "Anti-Tamper Alert", "OK", "Warning") | Out-Null
-                }
-            }
-
-            $state[$pid] = $current
+    foreach ($safe in $safePaths) {
+        if ($path -like "$safe*") {
+            $isSafe = $true
+            break
         }
     }
-    Start-Sleep -Seconds $IntervalSeconds
+
+    $status = if ($isSafe) { "OK" } else { "Suspicious" }
+
+    $result += [PSCustomObject]@{
+        DLLName = $module.ModuleName
+        FilePath = $path
+        Status = $status
+    }
 }
+
+# Output as table
+$result | Sort-Object Status, DLLName | Format-Table -AutoSize
