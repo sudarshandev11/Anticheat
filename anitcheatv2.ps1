@@ -1,11 +1,11 @@
-# PowerShell script to detect suspicious and potentially injected DLLs for specified applications
+# PowerShell script to detect suspicious and potentially injected DLLs for HD-Player.exe
 # Requires administrative privileges for full process and memory access
 
-# Define target applications (modify as needed for specific executables or paths)
-$targetApps = @("HD-Player", "BlueStacks", "msiexec", "MSIAfterburner") # Adjust process names as needed
+# Define target process
+$targetApp = "HD-Player" # Specifically targeting HD-Player.exe
 
 # Log file setup
-$logFile = "C:\Temp\DLL_Analysis_$(Get-Date -Format 'yyyyMMdd_HHmmss').txt"
+$logFile = "C:\Temp\HDPlayer_DLL_Analysis_$(Get-Date -Format 'yyyyMMdd_HHmmss').txt"
 if (-not (Test-Path "C:\Temp")) { New-Item -ItemType Directory -Path "C:\Temp" -Force | Out-Null }
 
 # Function to check if a file has a valid digital signature
@@ -41,7 +41,7 @@ function Test-DLLInjection {
         $injectionIndicators += "DLL file not found on disk (possible memory-only injection)"
     }
 
-    # Check for unusual paths (not in System32, Program Files, or known app directories)
+    # Check for unusual paths (not in System32, Program Files, or BlueStacks directories)
     if ($ModulePath -notlike "*\Windows\System32\*" -and 
         $ModulePath -notlike "*\Program Files\*" -and 
         $ModulePath -notlike "*\Program Files (x86)\*" -and 
@@ -104,16 +104,13 @@ function Analyze-ProcessDLLs {
 }
 
 # Main script
-Write-Host "Starting DLL analysis for target applications: $($targetApps -join ', ')" -ForegroundColor Cyan
-Add-Content -Path $logFile -Value "DLL Analysis Report - $(Get-Date)"
-Add-Content -Path $logFile -Value "Target Applications: $($targetApps -join ', ')"
+Write-Host "Starting DLL analysis for target process: $targetApp" -ForegroundColor Cyan
+Add-Content -Path $logFile -Value "DLL Analysis Report for HD-Player.exe - $(Get-Date)"
+Add-Content -Path $logFile -Value "Target Process: $targetApp"
 Add-Content -Path $logFile -Value "----------------------------------------"
 
-# Get all running processes
-$processes = Get-Process -ErrorAction SilentlyContinue | Where-Object {
-    $processName = $_.ProcessName
-    $targetApps | Where-Object { $processName -like "*$_*" }
-}
+# Get all running HD-Player.exe processes
+$processes = Get-Process -Name $targetApp -ErrorAction SilentlyContinue
 
 if ($processes) {
     foreach ($process in $processes) {
@@ -122,26 +119,28 @@ if ($processes) {
         Write-Host $result
     }
 } else {
-    $noProcessesMsg = "No running processes found for target applications: $($targetApps -join ', ')"
+    $noProcessesMsg = "No running processes found for $targetApp"
     Add-Content -Path $logFile -Value $noProcessesMsg
     Write-Host $noProcessesMsg -ForegroundColor Yellow
 }
 
-# Check for installed applications (optional, to detect if the software is installed but not running)
-Add-Content -Path $logFile -Value "`nChecking installed applications in registry..."
-foreach ($app in $targetApps) {
-    $installed = Get-ItemProperty "HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*" -ErrorAction SilentlyContinue | 
-        Where-Object { $_.DisplayName -like "*$app*" }
-    $installedWow = Get-ItemProperty "HKLM:\Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*" -ErrorAction SilentlyContinue | 
-        Where-Object { $_.DisplayName -like "*$app*" }
-    $installed += $installedWow
-    if ($installed) {
-        foreach ($item in $installed) {
-            $installedMsg = "Found installed application: $($item.DisplayName) (Version: $($item.DisplayVersion))"
-            Add-Content -Path $logFile -Value $installedMsg
-            Write-Host $installedMsg -ForegroundColor Green
-        }
+# Check for installed BlueStacks (since HD-Player.exe is typically part of BlueStacks)
+Add-Content -Path $logFile -Value "`nChecking installed BlueStacks in registry..."
+$installed = Get-ItemProperty "HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*" -ErrorAction SilentlyContinue | 
+    Where-Object { $_.DisplayName -like "*BlueStacks*" }
+$installedWow = Get-ItemProperty "HKLM:\Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*" -ErrorAction SilentlyContinue | 
+    Where-Object { $_.DisplayName -like "*BlueStacks*" }
+$installed += $installedWow
+if ($installed) {
+    foreach ($item in $installed) {
+        $installedMsg = "Found installed application: $($item.DisplayName) (Version: $($item.DisplayVersion))"
+        Add-Content -Path $logFile -Value $installedMsg
+        Write-Host $installedMsg -ForegroundColor Green
     }
+} else {
+    $noInstalledMsg = "No BlueStacks installation found in registry"
+    Add-Content -Path $logFile -Value $noInstalledMsg
+    Write-Host $noInstalledMsg -ForegroundColor Yellow
 }
 
 Write-Host "Analysis complete. Results saved to $logFile" -ForegroundColor Cyan
