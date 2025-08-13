@@ -1,146 +1,136 @@
-# PowerShell script to detect suspicious and potentially injected DLLs for HD-Player.exe
-# Requires administrative privileges for full process and memory access
+# anticheat_collector.ps1
+<#
+  Requires: PowerShell 7+ recommended (works in Windows PowerShell with adjustments)
+  Purpose: Collect process/module info, compute hashes, detect emulator indicators,
+           and post telemetry to server over HTTPS.
+  NOTE: This collects sensitive info. Use only with appropriate legal/consent policies.
+#>
 
-# Define target process
-$targetApp = "HD-Player" # Specifically targeting HD-Player.exe
+param(
+    [string]$TelemetryUrl = "https://your-server.example.com/api/telemetry",
+    [string]$ApiKey = "<REPLACE_WITH_API_KEY>",
+    [int]$MaxModulesPerProcess = 250
+)
 
-# Log file setup
-$logFile = "C:\Temp\HDPlayer_DLL_Analysis_$(Get-Date -Format 'yyyyMMdd_HHmmss').txt"
-if (-not (Test-Path "C:\Temp")) { New-Item -ItemType Directory -Path "C:\Temp" -Force | Out-Null }
+# --- SAFE LIST (lowercase names without paths) ---
+$SafeDlls = @(
+    "kernel32.dll","user32.dll","gdi32.dll","advapi32.dll","shell32.dll",
+    "ntdll.dll","msvcrt.dll","combase.dll","ucrtbase.dll","rpcrt4.dll",
+    "ws2_32.dll","shlwapi.dll"
+) | ForEach-Object { $_.ToLower() }
 
-# Function to check if a file has a valid digital signature
-function Test-DLLSignature {
-    param (
-        [string]$FilePath
-    )
+# Helper - compute SHA256 (file might be locked; handle exceptions)
+function Get-FileSHA256($path) {
     try {
-        if (-not (Test-Path $FilePath -ErrorAction SilentlyContinue)) {
-            return "File not found on disk (possible memory-only/injected DLL)"
+        $stream = [System.IO.File]::Open($path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        $sha = [System.Security.Cryptography.SHA256]::Create()
+        $hash = $sha.ComputeHash($stream)
+        $stream.Close()
+        return ([BitConverter]::ToString($hash)).Replace("-","").ToLower()
+    } catch {
+        return $null
+    }
+}
+
+# Helper - detect emulator artifacts
+function Detect-Emulator($proc) {
+    $pname = $proc.ProcessName.ToLower()
+    $indicators = @()
+    if ($pname -match "hd-player|bluestacks|bstbox|nox") { $indicators += "process-name:$($proc.ProcessName)" }
+    # Check executable path for emulator paths
+    try {
+        $exe = $proc.Path
+        if ($exe) {
+            $exeLower = $exe.ToLower()
+            if ($exeLower -like "*bluestacks*") { $indicators += "path:bluestacks" }
+            if ($exeLower -like "*nox*") { $indicators += "path:nox" }
         }
-        $signature = Get-AuthenticodeSignature -FilePath $FilePath -ErrorAction SilentlyContinue
-        if ($signature.Status -eq "Valid" -and $signature.SignerCertificate) {
-            return "Valid - Signed by: $($signature.SignerCertificate.Subject)"
-        } else {
-            return "Invalid or Unsigned"
+    } catch { }
+    return $indicators
+}
+
+Write-Host "Starting anti-cheat collector at $(Get-Date -Format 'u')" -ForegroundColor Cyan
+
+$procObjs = Get-Process | Sort-Object ProcessName
+$report = [System.Collections.Generic.List[object]]::new()
+
+foreach ($p in $procObjs) {
+    $entry = @{
+        ProcessName = $p.ProcessName
+        Id = $p.Id
+        UserName = $null
+        Path = $null
+        Modules = @()
+        EmulatorIndicators = @()
+    }
+
+    try {
+        # get executable path (may throw)
+        $proc = Get-CimInstance Win32_Process -Filter "ProcessId = $($p.Id)"
+        if ($proc) {
+            $entry.Path = $proc.ExecutablePath
+            # Owner
+            $owner = $proc.GetOwner()
+            $entry.UserName = if ($owner.ReturnValue -eq 0) { "$($owner.Domain)\$($owner.User)" } else { $null }
+        }
+    } catch { }
+
+    # Detect emulator indicators
+    $entry.EmulatorIndicators = Detect-Emulator($p)
+
+    try {
+        $modules = (Get-Process -Id $p.Id -ErrorAction Stop).Modules
+        $count = 0
+        foreach ($m in $modules) {
+            if ($count -ge $MaxModulesPerProcess) { break }
+            $dllName = [System.IO.Path]::GetFileName($m.FileName) -as [string]
+            $dllLower = $dllName.ToLower()
+            $isSafe = $SafeDlls -contains $dllLower
+            $hash = $null
+            if (-not $isSafe) {
+                # Try compute hash (skip system folders if necessary)
+                $hash = Get-FileSHA256($m.FileName)
+            }
+            $entry.Modules += @{
+                ModuleName = $dllName
+                Path = $m.FileName
+                IsSafe = $isSafe
+                SHA256 = $hash
+            }
+            $count++
         }
     } catch {
-        return "Error checking signature: $_"
+        # Access denied on system processes
     }
+
+    $report.Add($entry)
 }
 
-# Function to check for indicators of DLL injection
-function Test-DLLInjection {
-    param (
-        [string]$ModulePath,
-        [string]$ModuleName
-    )
-    $injectionIndicators = @()
-
-    # Check if the DLL file exists on disk
-    if (-not (Test-Path $ModulePath -ErrorAction SilentlyContinue)) {
-        $injectionIndicators += "DLL file not found on disk (possible memory-only injection)"
-    }
-
-    # Check for unusual paths (not in System32, Program Files, or BlueStacks directories)
-    if ($ModulePath -notlike "*\Windows\System32\*" -and 
-        $ModulePath -notlike "*\Program Files\*" -and 
-        $ModulePath -notlike "*\Program Files (x86)\*" -and 
-        $ModulePath -notlike "*\BlueStacks\*") {
-        $injectionIndicators += "Unusual path: $ModulePath"
-    }
-
-    # Check for suspicious module names (e.g., random strings, temp patterns)
-    if ($ModuleName -match "^[a-zA-Z0-9]{8}\.dll$" -or $ModuleName -like "*temp*.dll") {
-        $injectionIndicators += "Suspicious module name: $ModuleName"
-    }
-
-    return $injectionIndicators
+# Build telemetry object
+$payload = @{
+    Timestamp = (Get-Date).ToString("o")
+    Machine = (Get-WmiObject -Class Win32_ComputerSystem).Name
+    OS = (Get-WmiObject -Class Win32_OperatingSystem).Caption
+    Report = $report
 }
 
-# Function to analyze DLLs for a given process
-function Analyze-ProcessDLLs {
-    param (
-        [System.Diagnostics.Process]$Process
-    )
-    $output = "Analyzing process: $($Process.ProcessName) (PID: $($Process.Id), Path: $($Process.Path))\n"
-    $output += "----------------------------------------\n"
-    
-    try {
-        $modules = $Process.Modules
-        foreach ($module in $modules) {
-            $modulePath = $module.FileName
-            $moduleName = $module.ModuleName
-            $signatureStatus = Test-DLLSignature -FilePath $modulePath
-            $injectionIndicators = Test-DLLInjection -FilePath $modulePath -ModuleName $moduleName
-            
-            # Flag suspicious DLLs
-            $isSuspicious = $false
-            $suspiciousReason = ""
-            
-            if ($signatureStatus -notlike "Valid*") {
-                $isSuspicious = $true
-                $suspiciousReason += "Unsigned or invalid signature; "
-            }
-            if ($injectionIndicators) {
-                $isSuspicious = $true
-                $suspiciousReason += ($injectionIndicators -join "; ")
-            }
-            
-            $output += "DLL: $moduleName`n"
-            $output += "Path: $modulePath`n"
-            $output += "Signature: $signatureStatus`n"
-            if ($isSuspicious) {
-                $output += "Suspicious: Yes - Reason: $suspiciousReason`n"
-            } else {
-                $output += "Suspicious: No`n"
-            }
-            $output += "----------------------------------------\n"
-        }
-    } catch {
-        $output += "Error accessing modules for process $($Process.ProcessName): $_`n"
+# Convert to JSON and sign with HMAC (simple auth)
+$json = $payload | ConvertTo-Json -Depth 6
+$hmac = [System.Text.Encoding]::UTF8.GetBytes($ApiKey)
+$sha = New-Object System.Security.Cryptography.HMACSHA256 $hmac
+$signature = [System.Convert]::ToBase64String($sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($json)))
+
+# POST telemetry (example - ensure server uses TLS)
+try {
+    $headers = @{
+        "X-Client-Signature" = $signature
+        "X-Client-Time" = (Get-Date).ToString("o")
+        "Content-Type" = "application/json"
     }
-    
-    return $output
+    Invoke-RestMethod -Uri $TelemetryUrl -Method Post -Body $json -Headers $headers -ErrorAction Stop
+    Write-Host "Telemetry sent to server." -ForegroundColor Green
+} catch {
+    Write-Warning "Failed to send telemetry: $_"
 }
 
-# Main script
-Write-Host "Starting DLL analysis for target process: $targetApp" -ForegroundColor Cyan
-Add-Content -Path $logFile -Value "DLL Analysis Report for HD-Player.exe - $(Get-Date)"
-Add-Content -Path $logFile -Value "Target Process: $targetApp"
-Add-Content -Path $logFile -Value "----------------------------------------"
-
-# Get all running HD-Player.exe processes
-$processes = Get-Process -Name $targetApp -ErrorAction SilentlyContinue
-
-if ($processes) {
-    foreach ($process in $processes) {
-        $result = Analyze-ProcessDLLs -Process $process
-        Add-Content -Path $logFile -Value $result
-        Write-Host $result
-    }
-} else {
-    $noProcessesMsg = "No running processes found for $targetApp"
-    Add-Content -Path $logFile -Value $noProcessesMsg
-    Write-Host $noProcessesMsg -ForegroundColor Yellow
-}
-
-# Check for installed BlueStacks (since HD-Player.exe is typically part of BlueStacks)
-Add-Content -Path $logFile -Value "`nChecking installed BlueStacks in registry..."
-$installed = Get-ItemProperty "HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*" -ErrorAction SilentlyContinue | 
-    Where-Object { $_.DisplayName -like "*BlueStacks*" }
-$installedWow = Get-ItemProperty "HKLM:\Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*" -ErrorAction SilentlyContinue | 
-    Where-Object { $_.DisplayName -like "*BlueStacks*" }
-$installed += $installedWow
-if ($installed) {
-    foreach ($item in $installed) {
-        $installedMsg = "Found installed application: $($item.DisplayName) (Version: $($item.DisplayVersion))"
-        Add-Content -Path $logFile -Value $installedMsg
-        Write-Host $installedMsg -ForegroundColor Green
-    }
-} else {
-    $noInstalledMsg = "No BlueStacks installation found in registry"
-    Add-Content -Path $logFile -Value $noInstalledMsg
-    Write-Host $noInstalledMsg -ForegroundColor Yellow
-}
-
-Write-Host "Analysis complete. Results saved to $logFile" -ForegroundColor Cyan
+Write-Host "Collector finished at $(Get-Date -Format 'u')" -ForegroundColor Cyan
